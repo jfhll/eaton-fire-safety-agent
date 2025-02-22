@@ -4,16 +4,69 @@ from langchain_chroma import Chroma
 from langchain.prompts import PromptTemplate
 import anthropic
 import os
+import json
+import requests
+from bs4 import BeautifulSoup
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import chromadb
+import logging
 
 app = Flask(__name__)
 
-# Use environment variable or fallback to placeholder
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
 
-# Initialize embeddings with HuggingFace model
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+def build_database():
+    if os.path.exists("eaton_db") and os.path.exists("eaton_fire_docs.json"):
+        logger.info("Database already exists, skipping initialization.")
+        return
 
-# Initialize Chroma with the embedding function
+    logger.info("Building database on startup...")
+    urls = [
+        "https://laist.com/brief/news/climate-environment/researchers-tested-sandboxes-street-dust-lead-eaton-fire",
+        "https://www.kcrw.com/culture/shows/good-food/fire-soil-safety-lunar-new-year-china-dishes/eaton-palisades-fire-soil-ash-residue-fallout-danger-garden-fruit-vegetables",
+        "https://abc7.com/post/toxic-dangers-linger-inside-altadena-homes-survived-eaton-fire/15896312/"
+        # Reduced to 3 URLs for faster startup; add more later if needed
+    ]
+
+    documents = []
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=10)
+            soup = BeautifulSoup(response.content, "html.parser")
+            text = soup.get_text(separator=" ")
+            documents.append({"url": url, "content": text})
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = []
+    for doc in documents:
+        split_texts = splitter.split_text(doc["content"])
+        for i, text in enumerate(split_texts):
+            chunks.append({"url": doc["url"], "text": text, "id": f"{doc['url']}_{i}"})
+
+    with open("eaton_fire_docs.json", "w") as f:
+        json.dump(chunks, f)
+
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    client = chromadb.PersistentClient(path="./eaton_db")
+    collection = client.get_or_create_collection("eaton_fire_docs")
+    embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
+    collection.add(
+        documents=[chunk["text"] for chunk in chunks],
+        metadatas=[{"url": chunk["url"]} for chunk in chunks],
+        ids=[chunk["id"] for chunk in chunks],
+        embeddings=embeddings_list
+    )
+    logger.info("Database initialized on startup.")
+
+# Initialize embeddings and Chroma
+build_database()
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 vectorstore = Chroma(
     collection_name="eaton_fire_docs",
     embedding_function=embeddings,
@@ -42,6 +95,7 @@ def answer_question(question):
         answer = response.content[0].text
         return f"{answer}\n\n{sources}\nNote: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers."
     except Exception as e:
+        logger.error(f"Error answering question: {e}")
         return f"Error: {str(e)}"
 
 @app.route("/api/ask", methods=["POST"])
