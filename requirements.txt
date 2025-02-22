@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+langchain
+langchain-chroma
+langchain-huggingface  # Added for compatible embeddings
+chromadb
+flask
+anthropic

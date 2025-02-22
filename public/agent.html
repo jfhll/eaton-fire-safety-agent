@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Eaton Fire Safety Agent</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; max-width: 800px; margin: auto; }
+        textarea { width: 100%; height: 100px; margin-bottom: 10px; }
+        button { padding: 10px 20px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+        #answer { white-space: pre-wrap; word-wrap: break-word; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>Eaton Fire Safety Agent</h1>
+    <p>Ask a question about the Eaton Fire below:</p>
+    <textarea id="question" placeholder="e.g., What toxins are in the ash?"></textarea><br>
+    <button onclick="askQuestion()">Submit</button>
+    <h2>Answer:</h2>
+    <pre id="answer"></pre>
+
+    <script>
+        async function askQuestion() {
+            const question = document.getElementById("question").value;
+            if (!question) return;
+
+            const response = await fetch("https://eaton-fire-agent.onrender.com/api/ask", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question })
+            });
+            const data = await response.json();
+            document.getElementById("answer").textContent = data.answer || "Error: Try again.";
+        }
+    </script>
+</body>
+</html>
