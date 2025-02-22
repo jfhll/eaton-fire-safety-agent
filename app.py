@@ -19,17 +19,28 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
 
-def build_database():
-    if os.path.exists("eaton_db") and os.path.exists("eaton_fire_docs.json"):
-        logger.info("Database already exists, skipping initialization.")
-        return
+# Initialize embeddings globally
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-    logger.info("Building database on startup...")
+# Initialize Chroma (will use existing db or empty if not built)
+vectorstore = Chroma(
+    collection_name="eaton_fire_docs",
+    embedding_function=embeddings,
+    persist_directory="./eaton_db"
+)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I’m not a doctor or substitute for professional advice—contact an expert for Definitive answers.'"
+)
+
+def build_database():
+    logger.info("Building database...")
     urls = [
         "https://laist.com/brief/news/climate-environment/researchers-tested-sandboxes-street-dust-lead-eaton-fire",
         "https://www.kcrw.com/culture/shows/good-food/fire-soil-safety-lunar-new-year-china-dishes/eaton-palisades-fire-soil-ash-residue-fallout-danger-garden-fruit-vegetables",
         "https://abc7.com/post/toxic-dangers-linger-inside-altadena-homes-survived-eaton-fire/15896312/"
-        # Reduced to 3 URLs for faster startup; add more later if needed
     ]
 
     documents = []
@@ -52,7 +63,6 @@ def build_database():
     with open("eaton_fire_docs.json", "w") as f:
         json.dump(chunks, f)
 
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     client = chromadb.PersistentClient(path="./eaton_db")
     collection = client.get_or_create_collection("eaton_fire_docs")
     embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
@@ -62,24 +72,30 @@ def build_database():
         ids=[chunk["id"] for chunk in chunks],
         embeddings=embeddings_list
     )
-    logger.info("Database initialized on startup.")
+    logger.info("Database initialization complete.")
+    global vectorstore, retriever
+    vectorstore = Chroma(
+        collection_name="eaton_fire_docs",
+        embedding_function=embeddings,
+        persist_directory="./eaton_db"
+    )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-# Initialize embeddings and Chroma
-build_database()
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vectorstore = Chroma(
-    collection_name="eaton_fire_docs",
-    embedding_function=embeddings,
-    persist_directory="./eaton_db"
-)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+@app.route("/init", methods=["GET"])
+def init_db():
+    try:
+        build_database()
+        return jsonify({"status": "Database initialized"})
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        return jsonify({"error": str(e)}), 500
 
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
-)
-
-def answer_question(question):
+@app.route("/api/ask", methods=["POST"])
+def api_ask():
+    data = request.get_json()
+    question = data.get("question", "")
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
     try:
         docs = retriever.get_relevant_documents(question)
         context = "\n".join([doc.page_content for doc in docs])
@@ -93,20 +109,12 @@ def answer_question(question):
             messages=[{"role": "user", "content": prompt_text}]
         )
         answer = response.content[0].text
-        return f"{answer}\n\n{sources}\nNote: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers."
+        return jsonify({"answer": f"{answer}\n\n{sources}\nNote: I’m not a doctor or substitute for professional advice—contact an expert for Definitive answers."})
     except Exception as e:
         logger.error(f"Error answering question: {e}")
-        return f"Error: {str(e)}"
-
-@app.route("/api/ask", methods=["POST"])
-def api_ask():
-    data = request.get_json()
-    question = data.get("question", "")
-    if not question:
-        return jsonify({"error": "No question provided"}), 400
-    answer = answer_question(question)
-    return jsonify({"answer": answer})
+        return jsonify({"answer": f"Error: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))  # Render default is 10000
+    logger.info(f"Starting Flask on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
