@@ -1,4 +1,5 @@
 import os
+import zipfile
 import logging
 from flask import Flask, request, jsonify
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -22,14 +23,24 @@ vectorstore = None
 retriever = None
 db_initialized = False
 
+def unzip_eaton_db():
+    if os.path.exists("eaton_db.zip") and not os.path.exists("eaton_db"):
+        logger.info("Unzipping eaton_db.zip...")
+        with zipfile.ZipFile("eaton_db.zip", 'r') as zip_ref:
+            zip_ref.extractall()
+        logger.info("eaton_db unzipped successfully.")
+
 def load_preprocessed_data():
     global embeddings, vectorstore, retriever, db_initialized
     try:
         logger.info("Loading pre-processed data...")
 
-        # Check if eaton_db/ exists locally (assumed to be unzipped in Render)
+        # Unzip eaton_db.zip if not already extracted (assumed available in Render)
+        unzip_eaton_db()
+
+        # Check if eaton_db/ exists locally
         if not os.path.exists("eaton_db"):
-            raise Exception("eaton_db/ directory not found locally")
+            raise Exception("eaton_db/ directory not found locally after unzipping")
 
         # Load pre-processed chunks from JSON
         with open("eaton_fire_docs.json", "r") as f:
