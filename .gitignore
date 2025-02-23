@@ -67,3 +67,5 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+eaton_db/
+eaton_db.zip

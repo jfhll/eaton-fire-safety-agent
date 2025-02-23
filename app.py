@@ -1,16 +1,12 @@
+import os
+import logging
 from flask import Flask, request, jsonify
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain.prompts import PromptTemplate
 import anthropic
-import os
 import json
-import requests
-from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import chromadb
-import logging
-import threading
 
 app = Flask(__name__)
 
@@ -20,83 +16,70 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
 
-# Global variables (lazy-loaded)
+# Global variables (loaded on startup)
 embeddings = None
 vectorstore = None
 retriever = None
 db_initialized = False
 
-def init_db_background():
+def load_preprocessed_data():
     global embeddings, vectorstore, retriever, db_initialized
-    if db_initialized:
-        logger.info("Database already initialized, skipping.")
-        return
     try:
-        logger.info("Building database in background...")
-        urls = [
-            "https://laist.com/brief/news/climate-environment/researchers-tested-sandboxes-street-dust-lead-eaton-fire",
-            "https://www.kcrw.com/culture/shows/good-food/fire-soil-safety-lunar-new-year-china-dishes/eaton-palisades-fire-soil-ash-residue-fallout-danger-garden-fruit-vegetables",
-            "https://abc7.com/post/toxic-dangers-linger-inside-altadena-homes-survived-eaton-fire/15896312/"
-        ]
+        logger.info("Loading pre-processed data...")
 
-        documents = []
-        for url in urls:
-            try:
-                response = requests.get(url, timeout=10)
-                soup = BeautifulSoup(response.content, "html.parser")
-                text = soup.get_text(separator=" ")
-                documents.append({"url": url, "content": text})
-            except Exception as e:
-                logger.error(f"Error fetching {url}: {e}")
+        # Check if eaton_db/ exists locally (assumed to be unzipped in Render)
+        if not os.path.exists("eaton_db"):
+            raise Exception("eaton_db/ directory not found locally")
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = []
-        for doc in documents:
-            split_texts = splitter.split_text(doc["content"])
-            for i, text in enumerate(split_texts):
-                chunks.append({"url": doc["url"], "text": text, "id": f"{doc['url']}_{i}"})
+        # Load pre-processed chunks from JSON
+        with open("eaton_fire_docs.json", "r") as f:
+            chunks = json.load(f)
 
-        with open("eaton_fire_docs.json", "w") as f:
-            json.dump(chunks, f)
-
+        # Initialize embeddings
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        # Load or create Chroma vector store
         client = chromadb.PersistentClient(path="./eaton_db")
         collection = client.get_or_create_collection("eaton_fire_docs")
-        embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
-        collection.add(
-            documents=[chunk["text"] for chunk in chunks],
-            metadatas=[{"url": chunk["url"]} for chunk in chunks],
-            ids=[chunk["id"] for chunk in chunks],
-            embeddings=embeddings_list
-        )
+        
+        # If the collection is empty or needs updating, add the pre-processed data
+        if len(collection.count()) == 0:
+            embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
+            collection.add(
+                documents=[chunk["text"] for chunk in chunks],
+                metadatas=[{"url": chunk["url"]} for chunk in chunks],
+                ids=[chunk["id"] for chunk in chunks],
+                embeddings=embeddings_list
+            )
+        
+        # Initialize vector store and retriever
         vectorstore = Chroma(
             collection_name="eaton_fire_docs",
             embedding_function=embeddings,
             persist_directory="./eaton_db"
         )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 1})  # Fewer documents for speed
         db_initialized = True
-        logger.info("Database initialization complete.")
+        logger.info("Pre-processed data loaded successfully.")
     except Exception as e:
-        logger.error(f"Error in database initialization: {e}")
+        logger.error(f"Failed to load pre-processed data: {e}")
+        db_initialized = False
 
-# Start database initialization in a background thread
-threading.Thread(target=init_db_background, daemon=True).start()
+# Load pre-processed data on startup
+load_preprocessed_data()
 
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
-)
-
+# Health check route
 @app.route("/health", methods=["GET"])
 def health():
     logger.info("Health check requested")
     return jsonify({"status": "ok"})
 
+# Status check route
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({"db_initialized": db_initialized})
 
+# API ask route
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
     global db_initialized, retriever
@@ -118,13 +101,17 @@ def api_ask():
         logger.info("Documents retrieved")
         context = "\n".join([doc.page_content for doc in docs])
         sources = "\n".join([f"Source: {doc.metadata['url']}" for doc in docs])
+        prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
+        )
         prompt_text = prompt.format(context=context, question=question)
         
         logger.info("Calling Anthropic API")
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=500,
+            max_tokens=300,  # Reduced for speed
             messages=[{"role": "user", "content": prompt_text}]
         )
         logger.info("Anthropic API call successful")
