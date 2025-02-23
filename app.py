@@ -6,6 +6,7 @@ from langchain_chroma import Chroma
 from langchain.prompts import PromptTemplate
 import anthropic
 import json
+import chromadb
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 app = Flask(__name__)
@@ -22,27 +23,22 @@ vectorstore = None
 retriever = None
 db_initialized = False
 
-def load_preprocessed_data():
+def create_or_load_vectorstore(chunks):
     global embeddings, vectorstore, retriever, db_initialized
     try:
-        logger.info("Loading pre-processed data...")
-
-        # Check if eaton_db/ exists locally (assumed to be available in Render)
-        if not os.path.exists("eaton_db"):
-            raise Exception("eaton_db/ directory not found locally")
-
-        # Load pre-processed chunks from JSON
-        with open("eaton_fire_docs.json", "r") as f:
-            chunks = json.load(f)
-
+        logger.info("Creating or loading vector store...")
+        
         # Initialize embeddings
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         
-        # Load or create Chroma vector store
+        # Create or load Chroma vector store
+        if not os.path.exists("eaton_db"):
+            os.makedirs("eaton_db", exist_ok=True)
+        
         client = chromadb.PersistentClient(path="./eaton_db")
         collection = client.get_or_create_collection("eaton_fire_docs")
         
-        # If the collection is empty or needs updating, add the pre-processed data
+        # If the collection is empty, add the pre-processed data
         if len(collection.count()) == 0:
             embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
             collection.add(
@@ -60,7 +56,24 @@ def load_preprocessed_data():
         )
         retriever = vectorstore.as_retriever(search_kwargs={"k": 1})  # Fewer documents for speed
         db_initialized = True
-        logger.info("Pre-processed data loaded successfully.")
+        logger.info("Vector store created or loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to create or load vector store: {e}")
+        db_initialized = False
+
+def load_preprocessed_data():
+    global embeddings, vectorstore, retriever, db_initialized
+    try:
+        logger.info("Loading pre-processed data...")
+
+        # Load pre-processed chunks from JSON
+        if not os.path.exists("eaton_fire_docs.json"):
+            raise Exception("eaton_fire_docs.json not found locally")
+        
+        with open("eaton_fire_docs.json", "r") as f:
+            chunks = json.load(f)
+        
+        create_or_load_vectorstore(chunks)
     except Exception as e:
         logger.error(f"Failed to load pre-processed data: {e}")
         db_initialized = False
@@ -103,7 +116,7 @@ def api_ask():
         sources = "\n".join([f"Source: {doc.metadata['url']}" for doc in docs])
         prompt = PromptTemplate(
             input_variables=["context", "question"],
-            template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
+            template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I'm not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
         )
         prompt_text = prompt.format(context=context, question=question)
         
@@ -116,7 +129,7 @@ def api_ask():
         )
         logger.info("Anthropic API call successful")
         answer = response.content[0].text
-        return jsonify({"answer": f"{answer}\n\n{sources}\nNote: I’m not a doctor or substitute for professional advice—contact an expert for definitive answers."})
+        return jsonify({"answer": f"{answer}\n\n{sources}\nNote: I'm not a doctor or substitute for professional advice—contact an expert for definitive answers."})
     except Exception as e:
         logger.error(f"Error answering question: {e}")
         return jsonify({"answer": f"Error: {str(e)}"}), 500

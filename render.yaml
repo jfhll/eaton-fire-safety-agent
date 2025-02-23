@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: eaton-fire-safety-agent
+    runtime: python
+    runtimeConfig:
+      pythonVersion: "3.11"
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+    disk:
+      name: eaton-db
+      mountPath: /opt/render/project/src/eaton_db
+      sizeGB: 1
