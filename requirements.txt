@@ -1,12 +1,4 @@
-Flask==3.1.0
-langchain==0.0.195
-anthropic==0.43.0
-beautifulsoup4==4.9.3
-langchain-community==0.0.21
-langchain-core>=0.1.24
-langchain-anthropic>=0.1.0
-langchain-huggingface>=0.1.0
-langchain-chroma>=0.2.0
-chromadb>=0.4.0
-gunicorn==23.0.0
-tenacity>=8.0.0
+Flask
+anthropic>=0.46.0
+chromadb
+sentence-transformers

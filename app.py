@@ -1,140 +1,178 @@
 import os
 import logging
 from flask import Flask, request, jsonify
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_core.prompts import PromptTemplate
 import anthropic
 import json
 import chromadb
-from langchain_text_splitter import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+import time
+from functools import wraps
 
 app = Flask(__name__)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY_HERE")
+# Constants
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+RATE_LIMIT = 30  # requests per minute
+RATE_WINDOW = 60  # seconds
 
-# Global variables (loaded on startup)
-embeddings = None
-vectorstore = None
-retriever = None
-db_initialized = False
+# Global state
+db_client = None
+collection = None
+embedder = None
+request_times = []
 
-def create_or_load_vectorstore(chunks):
-    global embeddings, vectorstore, retriever, db_initialized
+def rate_limit_check():
+    """Simple rolling window rate limiter"""
+    now = time.time()
+    global request_times
+    request_times = [t for t in request_times if now - t < RATE_WINDOW]
+    if len(request_times) >= RATE_LIMIT:
+        return False
+    request_times.append(now)
+    return True
+
+def rate_limited(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not rate_limit_check():
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        return f(*args, **kwargs)
+    return decorated_function
+
+def init_database():
+    """Initialize the vector database and embedder"""
+    global db_client, collection, embedder
+    
     try:
-        logger.info("Creating or loading vector store...")
+        logger.info("Initializing database and embedder...")
         
-        # Initialize embeddings
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # Initialize sentence transformer
+        embedder = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Create or load Chroma vector store
-        if not os.path.exists("eaton_db"):
-            os.makedirs("eaton_db", exist_ok=True)
+        # Initialize ChromaDB
+        db_client = chromadb.PersistentClient(path="./eaton_db")
         
-        client = chromadb.PersistentClient(path="./eaton_db")
-        collection = client.get_or_create_collection("eaton_fire_docs")
+        # Get or create collection
+        collection = db_client.get_or_create_collection(
+            name="eaton_fire_docs",
+            metadata={"description": "Eaton fire safety documentation"}
+        )
         
-        # If the collection is empty, add the pre-processed data
-        if len(collection.count()) == 0:
-            embeddings_list = [embeddings.embed_query(chunk["text"]) for chunk in chunks]
+        # Load initial data if collection is empty
+        if collection.count() == 0:
+            logger.info("Loading initial data...")
+            with open("eaton_fire_docs.json", "r") as f:
+                docs = json.load(f)
+                
+            texts = [doc["text"] for doc in docs]
+            metadata = [{"url": doc["url"]} for doc in docs]
+            ids = [doc["id"] for doc in docs]
+            
+            # Generate embeddings
+            embeddings = embedder.encode(texts).tolist()
+            
+            # Add to collection
             collection.add(
-                documents=[chunk["text"] for chunk in chunks],
-                metadatas=[{"url": chunk["url"]} for chunk in chunks],
-                ids=[chunk["id"] for chunk in chunks],
-                embeddings=embeddings_list
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadata,
+                ids=ids
             )
+            
+        logger.info("Database initialization complete")
+        return True
         
-        # Initialize vector store and retriever
-        vectorstore = Chroma(
-            collection_name="eaton_fire_docs",
-            embedding_function=embeddings,
-            persist_directory="./eaton_db"
-        )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 1})  # Fewer documents for speed
-        db_initialized = True
-        logger.info("Vector store created or loaded successfully.")
     except Exception as e:
-        logger.error(f"Failed to create or load vector store: {e}")
-        db_initialized = False
+        logger.error(f"Database initialization failed: {e}")
+        return False
 
-def load_preprocessed_data():
-    global embeddings, vectorstore, retriever, db_initialized
+@app.route('/health')
+@rate_limited
+def health_check():
+    """Basic health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "database": db_client is not None and collection is not None,
+        "embedder": embedder is not None
+    })
+
+@app.route('/api/ask', methods=['POST'])
+@rate_limited
+def ask():
+    """Main query endpoint"""
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
     try:
-        logger.info("Loading pre-processed data...")
-
-        # Load pre-processed chunks from JSON
-        if not os.path.exists("eaton_fire_docs.json"):
-            raise Exception("eaton_fire_docs.json not found locally")
+        data = request.get_json()
+        question = data.get('question')
         
-        with open("eaton_fire_docs.json", "r") as f:
-            chunks = json.load(f)
+        if not question:
+            return jsonify({"error": "No question provided"}), 400
+            
+        # Generate embedding for question
+        question_embedding = embedder.encode(question).tolist()
         
-        create_or_load_vectorstore(chunks)
-    except Exception as e:
-        logger.error(f"Failed to load pre-processed data: {e}")
-        db_initialized = False
-
-# Load pre-processed data on startup
-load_preprocessed_data()
-
-# Health check route
-@app.route("/health", methods=["GET"])
-def health():
-    logger.info("Health check requested")
-    return jsonify({"status": "ok"})
-
-# Status check route
-@app.route("/status", methods=["GET"])
-def status():
-    return jsonify({"db_initialized": db_initialized})
-
-# API ask route
-@app.route("/api/ask", methods=["POST"])
-def api_ask():
-    global db_initialized, retriever
-    logger.info("Received request to /api/ask")
-    data = request.get_json()
-    if data is None:
-        logger.info("Invalid JSON")
-        return jsonify({"error": "Invalid JSON"}), 400
-    question = data.get("question", "")
-    if not question:
-        logger.info("No question provided")
-        return jsonify({"error": "No question provided"}), 400
-    if not db_initialized:
-        logger.info("Database not yet initialized")
-        return jsonify({"error": "Database not yet initialized, please try again in a moment"}), 503
-    try:
-        logger.info("Retrieving documents")
-        docs = retriever.get_relevant_documents(question)
-        logger.info("Documents retrieved")
-        context = "\n".join([doc.page_content for doc in docs])
-        sources = "\n".join([f"Source: {doc.metadata['url']}" for doc in docs])
-        prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template="Using this info: {context}\nAnswer this question naturally: {question}\nInclude citations (e.g., 'Source: [URL]') and end with: 'Note: I'm not a doctor or substitute for professional advice—contact an expert for definitive answers.'"
+        # Query collection
+        results = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=2  # Get top 2 most relevant chunks
         )
-        prompt_text = prompt.format(context=context, question=question)
         
-        logger.info("Calling Anthropic API")
+        # Prepare context from results
+        contexts = results['documents'][0]
+        sources = [m['url'] for m in results['metadatas'][0]]
+        
+        # Prepare prompt
+        context_text = "\n".join(contexts)
+        prompt = f"""You are a helpful AI assistant providing information about the Eaton fire. 
+Using only the following information, answer the question naturally and conversationally. 
+If you're not sure about something, say so.
+
+Information:
+{context_text}
+
+Question: {question}
+
+Remember to cite your sources using the format (Source: URL) after relevant statements."""
+
+        # Get response from Claude
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=300,  # Reduced for speed
-            messages=[{"role": "user", "content": prompt_text}]
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }]
         )
-        logger.info("Anthropic API call successful")
+        
         answer = response.content[0].text
-        return jsonify({"answer": f"{answer}\n\n{sources}\nNote: I'm not a doctor or substitute for professional advice—contact an expert for definitive answers."})
+        
+        # Add sources
+        source_text = "\n\nSources:\n" + "\n".join(f"- {url}" for url in sources)
+        
+        return jsonify({
+            "answer": answer + source_text
+        })
+        
     except Exception as e:
-        logger.error(f"Error answering question: {e}")
-        return jsonify({"answer": f"Error: {str(e)}"}), 500
+        logger.error(f"Error processing request: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Render default
-    logger.info(f"Starting Flask on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+if __name__ == '__main__':
+    # Initialize database on startup
+    if not init_database():
+        logger.error("Failed to initialize database. Exiting.")
+        exit(1)
+        
+    # Start server
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
